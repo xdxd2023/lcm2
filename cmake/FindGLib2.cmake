@@ -15,7 +15,6 @@ function(_glib2_find_include VAR HEADER)
     get_filename_component(_libpath ${GLIB2_${_lib}_LIBRARY} DIRECTORY)
     list(APPEND _paths ${_libpath})
   endforeach()
-
   find_path(GLIB2_${VAR}_INCLUDE_DIR ${HEADER}
     PATHS ${_paths}
     PATH_SUFFIXES glib-2.0 glib-2.0/include

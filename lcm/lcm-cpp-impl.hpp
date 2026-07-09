@@ -231,6 +231,10 @@ inline int LCM::send(const std::string &channel, const MessageType *msg, Message
                 break;
             }
         }
+        if(r == 0) 
+        {
+            break;
+        }
     }
     unsubscribe(sub);
     return r;
