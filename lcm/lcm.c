@@ -1,5 +1,7 @@
 
 #include <assert.h>
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +12,7 @@
 #include "dbg.h"
 #include "lcm.h"
 #include "lcm_internal.h"
+#include "udpm_util.h"
 
 #ifdef WIN32
 #include <winsock2.h>
@@ -34,6 +37,7 @@ struct _lcm_t {
 
     int default_max_num_queued_messages;
     int in_handle;
+    int handle_timeout_ms;  // for providers with no fd: timeout for handle()
 };
 
 struct _lcm_subscription_t {
@@ -123,6 +127,7 @@ lcm_t *lcm_create(const char *url)
 
     lcm->provider = info->vtable->create(lcm, network, args);
     lcm->in_handle = 0;
+    lcm->handle_timeout_ms = -1;
 
     free(provider_str);
     free(network);
@@ -218,7 +223,11 @@ int lcm_handle_timeout(lcm_t *lcm, int timeout_milis)
     SOCKET lcm_fd = lcm_get_fileno(lcm);
     if(lcm_fd < 0)
     {
-        return lcm_handle(lcm);
+        // No fd — pass timeout to provider so it can use cond_timedwait etc.
+        lcm->handle_timeout_ms = timeout_milis;
+        int ret = lcm_handle(lcm);
+        lcm->handle_timeout_ms = -1;
+        return ret;
     }
     FD_SET(lcm_fd, &fds);
 
@@ -230,13 +239,23 @@ int lcm_handle_timeout(lcm_t *lcm, int timeout_milis)
         return -1;
     }
 
+    int64_t t_select_before = lcm_timestamp_now();
     int select_result = select(lcm_fd + 1, &fds, NULL, NULL, &timeout);
+    int t_select_ms = (int)((lcm_timestamp_now() - t_select_before) / 1000);
+
     if (select_result > 0) {
+        int64_t t_handle_before = lcm_timestamp_now();
         int lcm_handle_result = lcm_handle(lcm);
+        int t_handle_ms = (int)((lcm_timestamp_now() - t_handle_before) / 1000);
+        dbg(DBG_LCM, "lcm_handle_timeout: select=%dms handle=%dms\n",
+            t_select_ms, t_handle_ms);
         return lcm_handle_result == 0 ? 1 : lcm_handle_result;
     } else if (select_result == 0) {
+        dbg(DBG_LCM, "lcm_handle_timeout: select timeout after %dms\n", t_select_ms);
         return 0;
     } else {
+        dbg(DBG_LCM, "lcm_handle_timeout: select error, ret=%d, errno=%d\n",
+            select_result, errno);
         return select_result;
     }
 }
@@ -510,4 +529,9 @@ int lcm_subscription_get_queue_size(lcm_subscription_t *subs)
     int result = subs->num_queued_messages;
     g_static_rec_mutex_unlock(&subs->lcm->mutex);
     return result;
+}
+
+int lcm_get_handle_timeout(lcm_t *lcm)
+{
+    return lcm->handle_timeout_ms;
 }

@@ -55,4 +55,8 @@ int lcm_has_handlers(lcm_t *lcm, const char *channel);
 
 int lcm_dispatch_handlers(lcm_t *lcm, lcm_recv_buf_t *buf, const char *channel);
 
+// For providers without an fd: allows lcm_handle_timeout to pass its
+// timeout through to the provider's handle() implementation.
+int  lcm_get_handle_timeout(lcm_t *lcm);
+
 #endif

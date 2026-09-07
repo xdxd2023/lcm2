@@ -572,6 +572,16 @@ static void *recv_thread(void *user)
          * non-empty. */
         g_static_rec_mutex_lock(&lcm->mutex);
 
+        // ★ 新增：如果队列已经太大，丢弃旧消息
+        if (lcm->inbufs_filled->count >= 1000) {
+            lcm_buf_t *old = lcm_buf_dequeue(lcm->inbufs_filled);
+            if (old) {
+                lcm_buf_free_data(old, lcm->ringbuf);
+                lcm_buf_enqueue(lcm->inbufs_empty, old);
+            }
+        }
+
+
         if (lcm_buf_queue_is_empty(lcm->inbufs_filled))
             if (lcm_internal_pipe_write(lcm->notify_pipe[1], "+", 1) < 0)
                 perror("write to notify");

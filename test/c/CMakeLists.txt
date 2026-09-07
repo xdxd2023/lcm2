@@ -15,8 +15,12 @@ target_link_libraries(test-c-eventlog_test ${test_c_libs})
 add_executable(test-c-udpm_test udpm_test.cpp common.c)
 target_link_libraries(test-c-udpm_test ${test_c_libs})
 
+add_executable(test-c-shm_test shm_test.cpp common.c)
+target_link_libraries(test-c-shm_test ${test_c_libs} rt)
+
 add_test(NAME C::memq_test COMMAND test-c-memq_test)
 add_test(NAME C::eventlog_test COMMAND test-c-eventlog_test)
+add_test(NAME C::shm_test COMMAND test-c-shm_test)
 
 if(PYTHON_EXECUTABLE)
   add_test(NAME C::client_server COMMAND
