@@ -6,6 +6,9 @@
 #include <assert.h>
 #include <errno.h>
 #include <time.h>
+#include <limits.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
 
 #include "dbg.h"
 #include "ipcshm.h"
@@ -34,76 +37,54 @@ typedef struct shm_header_t
 }shm_header_t;
 
 
-//消息存入
-static int _fifo_put(shm_fifo_t *fifo, void *items, uint32_t len)
+// ---- lock-free fifo access ------------------------------------------------
+// in/out are 64-bit cumulative counters shared across processes and read
+// lock-free by subscribers.  All accesses must therefore go through atomic
+// 64-bit loads/stores (armv7-a provides ldrexd/strexd for these).  Writers
+// are serialized by the producer mutex; a writer commits `in` with a release
+// store only after a whole message has been written, so a reader that loads
+// `in` with acquire semantics never observes a partially written message.
+
+static inline uint64_t fifo_in(shm_fifo_t *fifo)
 {
-    uint8_t *buffer = (uint8_t *)items;	//获取当前消息数据载入缓冲区
-    // 获取 fifo 中空闲长度 
-    len = min((uint32_t)(fifo->size - (uint32_t)(fifo->in - fifo->out)), len);
-	//获取 fifo 当前存入 in 的位置
-    uint32_t l = min(len, fifo->size - (uint32_t)(fifo->in & (fifo->size - 1)));
-    //载入的 buffer 数据到_msgfifo 队列中，存入 in 位置 超出后回到 size 的 0 位置，循环这样
-	memcpy((uint8_t *)fifo->data + (fifo->in & (fifo->size - 1)), buffer, l);
-    memcpy(fifo->data, buffer + l , (len - l));
-    fifo->in += len; //将 fifo 载入的位置 in 更新
-    return len; //返回 len 长度
-}
-//fifo 消息出列
-static int _fifo_get(shm_fifo_t *fifo, void *items, uint32_t len)
-{
-	//映射指向地址变量
-    uint8_t *buffer = (uint8_t *)items;
-    // 获取 fifo 中非空闲长度 
-    len = min((uint32_t)(fifo->in - fifo->out), len);
-    //获取 fifo 当前出列到 out 位置
-    uint32_t l = min(len, fifo->size - (uint32_t)(fifo->out & (fifo->size - 1)));
-    // 复制从 fifo->out 到尾部的数据
-    memcpy(buffer, (uint8_t*)fifo->data + (fifo->out & (fifo->size - 1)), l);
-    // 复制剩下的数据
-    memcpy(buffer + l, fifo->data, (len - l));
-    fifo->out += len; //将 fifo 出列的位置 out 更新
-    return len;	//返回 len 长度
+    return __atomic_load_n(&fifo->in, __ATOMIC_ACQUIRE);
 }
 
-static uint64_t _fifo_touch(shm_fifo_t *fifo, uint64_t pos, void *items, uint32_t len)
+static inline uint64_t fifo_out(shm_fifo_t *fifo)
 {
-	//映射指向地址变量
-    uint8_t *buffer = (uint8_t *)items;
-    // 获取 fifo 中非空闲长度 
-    uint64_t out = fifo->out > pos ? fifo->out : pos;
-    uint64_t avail = fifo->in - out;
-    uint64_t touch_len = (uint64_t)len < avail ? (uint64_t)len : avail;
-    if(touch_len <= 0)
-    {
-        return out;
-    }
-    //获取 fifo 当前出列到 out 位置
-    if(items != NULL)
-    {
-        uint32_t l = (uint32_t)min(touch_len, (uint64_t)(fifo->size - (out & (fifo->size - 1))));
-        // 复制从 fifo->out 到尾部的数据
-        memcpy(buffer, (uint8_t*)fifo->data + (out & (fifo->size - 1)), l);
-        // 复制剩下的数据
-        memcpy(buffer + l, fifo->data, (size_t)(touch_len - l));
-    }
-    return (uint64_t)(touch_len + out);	//返回 len 长度
+    return __atomic_load_n(&fifo->out, __ATOMIC_ACQUIRE);
 }
 
-static int _fifo_drop(shm_fifo_t *fifo, uint32_t len)
+static inline void fifo_in_store(shm_fifo_t *fifo, uint64_t v)
 {
-    len = min((uint32_t)(fifo->in - fifo->out), len);
-    fifo->out += len;
-    return len;
+    __atomic_store_n(&fifo->in, v, __ATOMIC_RELEASE);
 }
 
-uint32_t fifo_get_remain_size(shm_fifo_t *fifo)
+static inline void fifo_out_store(shm_fifo_t *fifo, uint64_t v)
 {
-    return fifo->size - (uint32_t)(fifo->in - fifo->out);
+    __atomic_store_n(&fifo->out, v, __ATOMIC_RELEASE);
 }
 
-bool fifo_is_empty(shm_fifo_t *fifo)
+// Wrap-aware copy: read `len` bytes starting at cumulative position `pos`.
+// Caller must guarantee pos+len <= committed `in`.
+static void fifo_read_at(shm_fifo_t *fifo, uint64_t pos, void *buf, uint32_t len)
 {
-    return fifo->in == fifo->out;
+    uint8_t *b = (uint8_t *)buf;
+    uint32_t off = (uint32_t)(pos & (fifo->size - 1));
+    uint32_t l = min(len, fifo->size - off);
+    memcpy(b, (uint8_t *)fifo->data + off, l);
+    memcpy(b + l, fifo->data, len - l);
+}
+
+// Wrap-aware write: write `len` bytes starting at cumulative position `pos`.
+// Does NOT advance `in`; the writer commits `in` afterwards.
+static void fifo_write_at(shm_fifo_t *fifo, uint64_t pos, const void *buf, uint32_t len)
+{
+    const uint8_t *b = (const uint8_t *)buf;
+    uint32_t off = (uint32_t)(pos & (fifo->size - 1));
+    uint32_t l = min(len, fifo->size - off);
+    memcpy((uint8_t *)fifo->data + off, b, l);
+    memcpy(fifo->data, b + l, len - l);
 }
 
 bool lock(pthread_mutex_t *mutex)
@@ -122,6 +103,28 @@ bool lock(pthread_mutex_t *mutex)
 void unlock(pthread_mutex_t *mutex)
 {
     pthread_mutex_unlock(mutex);
+}
+
+// ---- futex helpers ---------------------------------------------------------
+// last_msg_num doubles as the futex word: the publisher increments it and
+// wakes waiters, subscribers sleep on it.  Unlike a shared-memory
+// pthread_cond_t, the kernel owns the wait queue, so a crashed process
+// cannot corrupt it and freeze the other processes.
+
+static int futex_wait(uint32_t *uaddr, uint32_t expected, const struct timespec *timeout)
+{
+    return syscall(SYS_futex, uaddr, FUTEX_WAIT, expected, timeout, NULL, 0);
+}
+
+static int futex_wake(uint32_t *uaddr, int n)
+{
+    return syscall(SYS_futex, uaddr, FUTEX_WAKE, n, NULL, NULL, 0);
+}
+
+// wrap-around-aware "newer than" test (valid for differences < 2^31)
+static bool msg_num_newer(uint32_t a, uint32_t b)
+{
+    return (int32_t)(a - b) > 0;
 }
 
 int shm_get_lastest_msg_num(shm_t * header)
@@ -219,40 +222,59 @@ void shm_deinit(shm_t *header)
 
 bool shm_publish(shm_t *header, const char *channel, const void *data, uint32_t datalen)
 {
+    uint32_t total = sizeof(shm_msg_header_t) + datalen;
     assert(datalen <= header->fifo.size - sizeof(shm_msg_header_t));
     int len = strlen(channel);
     assert(len < 256);
-    while(!lock(&header->mutex)) {}
-    int count = 0;
-    while(fifo_get_remain_size(&header->fifo) < datalen + sizeof(shm_msg_header_t))
-    {
-        shm_msg_t msg = {0};
-        uint32_t len = _fifo_get(&header->fifo, &msg, sizeof(shm_msg_header_t));
-        len = _fifo_drop(&header->fifo,  msg.header.size);
 
-        if(count++ > 65535)
+    // Serialize writers only.  Readers are lock-free, so holding this mutex
+    // during the payload memcpy does NOT block subscribers.
+    while(!lock(&header->mutex)) {}
+
+    // Reserve the next message number (writers are serialized by the mutex).
+    uint32_t msg_num = header->last_msg_num + 1;
+    if (msg_num == 0)
+        msg_num = 1;
+
+    uint64_t in  = fifo_in(&header->fifo);
+    uint64_t out = fifo_out(&header->fifo);
+
+    // Make room by dropping the oldest messages (only when full).
+    int count = 0;
+    while (header->fifo.size - (uint32_t)(in - out) < total)
+    {
+        shm_msg_t old = {0};
+        fifo_read_at(&header->fifo, out, &old, sizeof(shm_msg_header_t));
+        out += sizeof(shm_msg_header_t) + old.header.size;
+        if (++count > 65535)
         {
-            printf("fifo in = %lu, out = %lu, cannot make room, dropping publish\n",
-                   (unsigned long)header->fifo.in, (unsigned long)header->fifo.out);
+            // printf("fifo in=%lu out=%lu, cannot make room, dropping publish\n",
+            //        (unsigned long)in, (unsigned long)out);
             unlock(&header->mutex);
             return false;
         }
     }
-    {
-        shm_msg_t msg = {0};
-        msg.header.size = datalen;
-        strncpy(msg.header.channel, channel, sizeof(msg.header.channel) - 1);
-        msg.header.channel[sizeof(msg.header.channel) - 1] = '\0';
-        msg.header.msg_num = ++ header->last_msg_num;
-        dbg(DBG_LCM, "msg.header.msg_num: %d\n", msg.header.msg_num);
-        if(msg.header.msg_num == 0)
-        {
-            msg.header.msg_num = ++ header->last_msg_num;
-        }
-        _fifo_put(&header->fifo, &msg, sizeof(shm_msg_header_t));
-        _fifo_put(&header->fifo, data, datalen);
-    }
+    fifo_out_store(&header->fifo, out);
+
+    // Build the message header.
+    shm_msg_t msg = {0};
+    msg.header.size = datalen;
+    strncpy(msg.header.channel, channel, sizeof(msg.header.channel) - 1);
+    msg.header.channel[sizeof(msg.header.channel) - 1] = '\0';
+    msg.header.msg_num = msg_num;
+    dbg(DBG_LCM, "msg.header.msg_num: %d\n", msg.header.msg_num);
+
+    // Write header + payload, then commit `in` (release) so readers never see
+    // a partially written message.
+    fifo_write_at(&header->fifo, in, &msg, sizeof(shm_msg_header_t));
+    fifo_write_at(&header->fifo, in + sizeof(shm_msg_header_t), data, datalen);
+    fifo_in_store(&header->fifo, in + total);
+
+    // Publish the message number only AFTER the ring data is committed.
+    __atomic_store_n(&header->last_msg_num, msg_num, __ATOMIC_RELEASE);
+
     unlock(&header->mutex);
+    futex_wake(&header->last_msg_num, INT_MAX);
     return true;
 }
 
@@ -264,122 +286,111 @@ bool compare_msgnum(uint32_t a, uint32_t b)
 
 bool shm_read(shm_t *header, uint32_t msg_num, uint64_t *last_msg_pos, shm_msgr_t *msgr)
 {
-    while(!lock(&header->mutex)) {}
-    
-    if(header->last_msg_num == msg_num)
-    {
-        unlock(&header->mutex);
+    uint32_t latest = __atomic_load_n(&header->last_msg_num, __ATOMIC_ACQUIRE);
+    if (!msg_num_newer(latest, msg_num))
         return false;
-    }
-    shm_msg_t msg = {0};
-    if(*last_msg_pos == 0 || *last_msg_pos < header->fifo.out)
-    {
-        *last_msg_pos = header->fifo.out;
-    }
+
     uint64_t pos = *last_msg_pos;
+    uint64_t out = fifo_out(&header->fifo);
+    if (pos == 0 || pos < out)
+        pos = out;
+
     int count = 0;
-    int skipped = 0;
-    while(true)
+    for (;;)
     {
-        // Safety: if pos has fallen behind the writer's drop point,
-        // reset to the current valid data start.
-        if(pos < header->fifo.out)
+        // Re-read the floor each iteration: the publisher may have dropped
+        // older messages (advancing `out`) while we were scanning.
+        out = fifo_out(&header->fifo);
+        if (pos < out)
+            pos = out;
+
+        uint64_t in = fifo_in(&header->fifo);
+        if (pos >= in)
         {
-            dbg(DBG_LCM, "shm_read: pos=%lu behind out=%lu, resetting\n",
-                (unsigned long)pos, (unsigned long)header->fifo.out);
-            pos = header->fifo.out;
-        }
-        // Safety: if pos has somehow advanced past the writer, nothing left.
-        if(pos >= header->fifo.in)
-        {
-            dbg(DBG_LCM, "shm_read: pos=%lu past in=%lu, no more data\n",
-                (unsigned long)pos, (unsigned long)header->fifo.in);
-            if(skipped > 0)
-                dbg(DBG_LCM, "shm_read: skipped=%d before hitting in\n", skipped);
             *last_msg_pos = pos;
-            unlock(&header->mutex);
-            return false;
+            return false;  // no more committed data
         }
-       
-        pos = _fifo_touch(&header->fifo, pos, &msg, sizeof(shm_msg_header_t));
-        if(count++ >= 65535)
+
+        shm_msg_t msg = {0};
+        fifo_read_at(&header->fifo, pos, &msg, sizeof(shm_msg_header_t));
+        if (++count > 65535)
         {
-            fprintf(stderr, "shm_read: stuck looping! in=%lu out=%lu pos=%lu "
-                    "last_pos=%lu msg_num=%u hdr_msg_num=%u hdr_size=%u chan=%.32s\n",
-                    (unsigned long)header->fifo.in, (unsigned long)header->fifo.out,
-                    (unsigned long)pos, (unsigned long)*last_msg_pos,
-                    msg_num, msg.header.msg_num, msg.header.size,
-                    msg.header.channel[0] ? msg.header.channel : "(empty)");
+            fprintf(stderr, "shm_read: stuck looping! in=%lu out=%lu pos=%lu msg_num=%u\n",
+                    (unsigned long)in, (unsigned long)out, (unsigned long)pos, msg_num);
             *last_msg_pos = pos;
-            unlock(&header->mutex);
             return false;
         }
-        if(msg.header.size == 0)
+        if (msg.header.size == 0)
         {
-            dbg(DBG_LCM, "shm_read: no more data, skipped=%d\n", skipped);
-            unlock(&header->mutex);
+            *last_msg_pos = pos;
             return false;
         }
-        if(compare_msgnum(msg_num, msg.header.msg_num))
+
+        if (compare_msgnum(msg_num, msg.header.msg_num))
         {
-            pos += msg.header.size;
-            skipped++;
+            // Already-seen message: skip it.
+            pos += sizeof(shm_msg_header_t) + msg.header.size;
+            continue;
         }
+
+        // Found the first message newer than msg_num.  Copy it out.
+        uint64_t msg_pos = pos;
+        msgr->msg.header = msg.header;
+        if (msg.header.size < sizeof(msgr->msg.data))
+            fifo_read_at(&header->fifo, pos + sizeof(shm_msg_header_t), msgr->msg.data, msg.header.size);
         else
         {
-            if(msg.header.size < sizeof(msgr->msg.data))
-            {
-                msgr->msg.header.size = msg.header.size;
-                msgr->msg.header.msg_num = msg.header.msg_num;
-                strcpy(msgr->msg.header.channel, msg.header.channel);
-                pos = _fifo_touch(&header->fifo, pos, msgr->msg.data, msg.header.size);
-            }
-            else
-            {
-
-                msgr->msg.header.size = msg.header.size;
-                msgr->msg.header.msg_num = msg.header.msg_num;
-                strcpy(msgr->msg.header.channel, msg.header.channel);
-                msgr->buff = (uint8_t *)malloc(msg.header.size);
-                pos = _fifo_touch(&header->fifo, pos, msgr->buff, msg.header.size);
-            }
-            break;
+            msgr->buff = (uint8_t *)malloc(msg.header.size);
+            fifo_read_at(&header->fifo, pos + sizeof(shm_msg_header_t), msgr->buff, msg.header.size);
         }
+
+        // If the publisher dropped this message while we were copying it,
+        // discard and restart from the new floor (our copy may be stale).
+        if (msg_pos < fifo_out(&header->fifo))
+        {
+            if (msgr->buff) { free(msgr->buff); msgr->buff = NULL; }
+            pos = fifo_out(&header->fifo);
+            continue;
+        }
+
+        pos += sizeof(shm_msg_header_t) + msg.header.size;
+        *last_msg_pos = pos;
+        return true;
     }
-    dbg(DBG_LCM, "shm_read: found msg %u, skipped %d older msgs, pos=%lu, header->fifo.in=%lu\n", msg.header.msg_num, skipped, (unsigned long)pos, (unsigned long)header->fifo.in);
-    *last_msg_pos = pos;
-    unlock(&header->mutex);
-    return true;
 }
 
-// Atomically wait for a new message and read it.
-// Solves the "one write, many readers" problem that FIFO cannot handle:
-// pthread_cond_broadcast wakes ALL readers; each atomically checks+reads
-// under the same mutex.
+// Wait until a message newer than msg_no is available.
+// Sleeps on the last_msg_num futex word: the publisher increments it and
+// calls futex_wake, waking us with no polling delay.  Crash-safe because
+// the kernel owns the wait queue (a dead process cannot corrupt it).
 int shm_wait(shm_t *header, uint32_t msg_no, int timeout_ms)
 {
-    // Poll with usleep.  pthread_cond_t in shared memory is not robust:
-    // a crashed process corrupts the condvar, freezing all other processes.
-    // Simple polling avoids this entirely.
-    // int elapsed = 0;
-    // while(1)
-    // {
-    //     while(!lock(&header->mutex)) {}
-    //     if(header->last_msg_num > msg_no)
-    //     {
-    //         unlock(&header->mutex);
-    //         return 1;
-    //     }
-    //     unlock(&header->mutex);
+    uint32_t cur = __atomic_load_n(&header->last_msg_num, __ATOMIC_ACQUIRE);
+    if (msg_num_newer(cur, msg_no))
+        return 1;
 
-    //     if(timeout_ms == 0)
-    //         return 0;
-    //     if(timeout_ms > 0 && elapsed >= timeout_ms)
-    //         return 0;
+    if (timeout_ms == 0)
+        return 0;  // non-blocking
 
-    //     usleep(1000);  // 1ms
-    //     elapsed += 1;
-    // }
-    usleep(1000); 
-    return 1;
+    struct timespec ts;
+    struct timespec *pts = NULL;
+    if (timeout_ms > 0) {
+        ts.tv_sec  = timeout_ms / 1000;
+        ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
+        pts = &ts;
+    }
+
+    for (;;) {
+        // FUTEX_WAIT atomically re-checks *uaddr == cur before sleeping,
+        // so a message arriving between the check above and this call is
+        // not missed (it returns EAGAIN instead of sleeping).
+        int ret = futex_wait(&header->last_msg_num, cur, pts);
+        if (ret == 0 || (ret == -1 && errno == EAGAIN)) {
+            cur = __atomic_load_n(&header->last_msg_num, __ATOMIC_ACQUIRE);
+            if (msg_num_newer(cur, msg_no))
+                return 1;
+            continue;  // spurious wakeup — wait again
+        }
+        return 0;  // ETIMEDOUT / EINTR / error
+    }
 }

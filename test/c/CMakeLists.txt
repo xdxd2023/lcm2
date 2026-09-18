@@ -18,6 +18,9 @@ target_link_libraries(test-c-udpm_test ${test_c_libs})
 add_executable(test-c-shm_test shm_test.cpp common.c)
 target_link_libraries(test-c-shm_test ${test_c_libs} rt)
 
+add_executable(test-c-shm_bench shm_bench.cpp)
+target_link_libraries(test-c-shm_bench lcm rt)
+
 add_test(NAME C::memq_test COMMAND test-c-memq_test)
 add_test(NAME C::eventlog_test COMMAND test-c-eventlog_test)
 add_test(NAME C::shm_test COMMAND test-c-shm_test)
