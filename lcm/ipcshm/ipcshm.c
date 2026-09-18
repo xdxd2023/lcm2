@@ -136,6 +136,16 @@ int shm_get_lastest_msg_num(shm_t * header)
     return r;
 }
 
+uint32_t shm_get_msg_num(shm_t *header)
+{
+    return __atomic_load_n(&header->last_msg_num, __ATOMIC_ACQUIRE);
+}
+
+void shm_notify_waiters(shm_t *header)
+{
+    futex_wake(&header->last_msg_num, INT_MAX);
+}
+
 shm_t * shm_create(uint32_t size, bool sharem)
 {
     if(sharem)
@@ -363,8 +373,15 @@ bool shm_read(shm_t *header, uint32_t msg_num, uint64_t *last_msg_pos, shm_msgr_
 // Sleeps on the last_msg_num futex word: the publisher increments it and
 // calls futex_wake, waking us with no polling delay.  Crash-safe because
 // the kernel owns the wait queue (a dead process cannot corrupt it).
-int shm_wait(shm_t *header, uint32_t msg_no, int timeout_ms)
+//
+// `stop`, when non-NULL, is checked around the sleep: a concurrent
+// shm_notify_waiters() then makes the wait return -1 instead of blocking
+// until the timeout, so a shutting-down thread can abandon the futex promptly.
+static int shm_wait_impl(shm_t *header, uint32_t msg_no, int timeout_ms, volatile int *stop)
 {
+    if (stop && *stop)
+        return -1;
+
     uint32_t cur = __atomic_load_n(&header->last_msg_num, __ATOMIC_ACQUIRE);
     if (msg_num_newer(cur, msg_no))
         return 1;
@@ -381,10 +398,19 @@ int shm_wait(shm_t *header, uint32_t msg_no, int timeout_ms)
     }
 
     for (;;) {
+        // Checked here so a futex_wake() racing with this loop cannot be lost:
+        // either we observe the flag, or we are already asleep and get woken.
+        if (stop && *stop)
+            return -1;
+
         // FUTEX_WAIT atomically re-checks *uaddr == cur before sleeping,
         // so a message arriving between the check above and this call is
         // not missed (it returns EAGAIN instead of sleeping).
         int ret = futex_wait(&header->last_msg_num, cur, pts);
+
+        if (stop && *stop)
+            return -1;  // interrupted by shm_notify_waiters()
+
         if (ret == 0 || (ret == -1 && errno == EAGAIN)) {
             cur = __atomic_load_n(&header->last_msg_num, __ATOMIC_ACQUIRE);
             if (msg_num_newer(cur, msg_no))
@@ -393,4 +419,14 @@ int shm_wait(shm_t *header, uint32_t msg_no, int timeout_ms)
         }
         return 0;  // ETIMEDOUT / EINTR / error
     }
+}
+
+int shm_wait(shm_t *header, uint32_t msg_no, int timeout_ms)
+{
+    return shm_wait_impl(header, msg_no, timeout_ms, NULL);
+}
+
+int shm_wait_stop(shm_t *header, uint32_t msg_no, int timeout_ms, volatile int *stop)
+{
+    return shm_wait_impl(header, msg_no, timeout_ms, stop);
 }

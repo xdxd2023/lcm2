@@ -29,7 +29,21 @@ bool shm_publish(shm_t *header, const char *channel, const void *data, uint32_t 
 bool shm_read(shm_t *header, uint32_t msg_num, uint64_t *last_msg_pos, shm_msgr_t *msgr);
 int shm_get_lastest_msg_num(shm_t * header);
 
+// Lock-free load of the newest published message number.  Same value that
+// shm_wait() compares against, but without taking the writer mutex.
+uint32_t shm_get_msg_num(shm_t *header);
+
 // Block until a message newer than msg_no arrives.
 // timeout_ms: <0 = forever, 0 = non-blocking, >0 = N ms.
 // Returns 1 when new data available, 0 on timeout.
 int  shm_wait(shm_t *header, uint32_t msg_no, int timeout_ms);
+
+// Same as shm_wait(), but also returns -1 as soon as *stop becomes non-zero.
+// A concurrent shm_notify_waiters() interrupts the underlying futex sleep, so
+// a thread that is shutting down does not have to wait for timeout_ms.
+int  shm_wait_stop(shm_t *header, uint32_t msg_no, int timeout_ms, volatile int *stop);
+
+// Wake every thread currently blocked in shm_wait().  Purely a wakeup: no
+// message number is changed, so waiters just re-evaluate their condition.
+// Used to interrupt a waiter that is shutting down.
+void shm_notify_waiters(shm_t *header);
