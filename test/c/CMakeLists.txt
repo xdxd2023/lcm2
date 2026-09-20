@@ -21,6 +21,10 @@ target_link_libraries(test-c-shm_test ${test_c_libs} rt)
 add_executable(test-c-shm_bench shm_bench.cpp)
 target_link_libraries(test-c-shm_bench lcm rt)
 
+# 延迟/CPU/通道速率基准, 交叉编译后可直接在设备上跑 (用法见文件头注释)
+add_executable(test-c-lcm_bench lcm_bench.c)
+target_link_libraries(test-c-lcm_bench lcm GLib2::glib rt pthread)
+
 add_test(NAME C::memq_test COMMAND test-c-memq_test)
 add_test(NAME C::eventlog_test COMMAND test-c-eventlog_test)
 add_test(NAME C::shm_test COMMAND test-c-shm_test)
