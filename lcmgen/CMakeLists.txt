@@ -44,6 +44,8 @@ endif()
 
 add_executable(lcm-gen ${lcm-gen_sources})
 target_link_libraries(lcm-gen PRIVATE GLib2::glib)
+find_package(Threads REQUIRED)
+target_link_libraries(lcm-gen PRIVATE Threads::Threads)
 
 install(TARGETS lcm-gen
   EXPORT lcmTargets

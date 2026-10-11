@@ -1,5 +1,5 @@
 if(UNIX)
-  find_package(Threads)
+  find_package(Threads REQUIRED)
 endif()
 
 set(lcm_sources
@@ -76,9 +76,14 @@ foreach(lcm_lib lcm lcm-static)
 
   target_link_libraries(${lcm_lib} PRIVATE
     GLib2::glib
-    ${CMAKE_THREAD_LIBS_INIT}
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
     rt
   )
+
+  if(UNIX)
+    target_link_libraries(${lcm_lib} PUBLIC Threads::Threads)
+  endif()
 endforeach()
 
 generate_export_header(lcm STATIC_DEFINE LCM_STATIC)
